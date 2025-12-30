@@ -79,7 +79,7 @@ class SUPIRModel(DiffusionEngine):
     @torch.no_grad()
     def batchify_sample(self, x, p, p_p='default', n_p='default', num_steps=100, restoration_scale=4.0, s_churn=0, s_noise=1.003, cfg_scale=4.0, seed=-1,
                         num_samples=1, control_scale=1, color_fix_type='None', use_linear_CFG=False, use_linear_control_scale=False,
-                        cfg_scale_start=1.0, control_scale_start=0.0, **kwargs):
+                        cfg_scale_start=1.0, control_scale_start=0.0, hr_tensor=None, mask_tensor=None, **kwargs):
         '''
         [N, C], [-1, 1], RGB
         '''
@@ -118,16 +118,44 @@ class SUPIRModel(DiffusionEngine):
         x_stage1 = self.decode_first_stage(_z)
         z_stage1 = self.encode_first_stage(x_stage1)
 
+        hr_latent = None
+        mask_latent = None
+        if hr_tensor is not None:
+            hr_latent = self.encode_first_stage(hr_tensor)
+            if mask_tensor is not None:
+                # resize mask to latent spatial size, nearest to keep binary edges
+                mask_latent = torch.nn.functional.interpolate(mask_tensor, size=hr_latent.shape[-2:], mode='nearest')
+                # broadcast to channels if needed
+                if mask_latent.shape[1] == 1:
+                    mask_latent = mask_latent.expand(-1, hr_latent.shape[1], -1, -1)
+
         c, uc = self.prepare_condition(_z, p, p_p, n_p, N)
 
-        denoiser = lambda input, sigma, c, control_scale: self.denoiser(
-            self.model, input, sigma, c, control_scale, **kwargs
-        )
+        base_latent = _z  # keep original LQ latent for regions outside the mask
+
+        def _blend_x0(x0_pred):
+            if mask_latent is not None:
+                # resize to current latent size if tile VAE changed spatial dims
+                if mask_latent.shape[-2:] != x0_pred.shape[-2:]:
+                    mask_resized = torch.nn.functional.interpolate(mask_latent, size=x0_pred.shape[-2:], mode='nearest')
+                else:
+                    mask_resized = mask_latent
+
+                base_resized = base_latent
+                if base_resized.shape[-2:] != x0_pred.shape[-2:]:
+                    base_resized = torch.nn.functional.interpolate(base_latent, size=x0_pred.shape[-2:], mode='bilinear', align_corners=False)
+
+                return mask_resized * x0_pred + (1.0 - mask_resized) * base_resized
+            return x0_pred
+
+        def denoiser(input, sigma, c, control_scale):
+            out = self.denoiser(self.model, input, sigma, c, control_scale, **kwargs)
+            return _blend_x0(out)
 
         noised_z = torch.randn_like(_z).to(_z.device)
 
         _samples = self.sampler(denoiser, noised_z, cond=c, uc=uc, x_center=z_stage1, control_scale=control_scale,
-                                use_linear_control_scale=use_linear_control_scale, control_scale_start=control_scale_start)
+                    use_linear_control_scale=use_linear_control_scale, control_scale_start=control_scale_start)
         samples = self.decode_first_stage(_samples)
         if color_fix_type == 'Wavelet':
             samples = wavelet_reconstruction(samples, x_stage1)

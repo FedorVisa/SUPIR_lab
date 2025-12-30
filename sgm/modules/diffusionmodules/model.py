@@ -13,7 +13,8 @@ try:
     import xformers.ops
 
     XFORMERS_IS_AVAILABLE = True
-except:
+except Exception:
+    xformers = None  # ensure symbol exists to avoid NameError
     XFORMERS_IS_AVAILABLE = False
     print("no module 'xformers'. Processing without...")
 
@@ -243,9 +244,16 @@ class MemoryEfficientAttnBlock(nn.Module):
             .contiguous(),
             (q, k, v),
         )
-        out = xformers.ops.memory_efficient_attention(
-            q, k, v, attn_bias=None, op=self.attention_op
-        )
+        if XFORMERS_IS_AVAILABLE:
+            out = xformers.ops.memory_efficient_attention(
+                q, k, v, attn_bias=None, op=self.attention_op
+            )
+        else:
+            # Fallback to plain scaled dot-product attention on CPU/GPU without xformers
+            scale = 1.0 / math.sqrt(C)
+            attn = torch.bmm(q, k.transpose(1, 2)) * scale
+            attn = torch.softmax(attn, dim=-1)
+            out = torch.bmm(attn, v)
 
         out = (
             out.unsqueeze(0)

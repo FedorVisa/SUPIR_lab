@@ -1,10 +1,12 @@
 import torch.cuda
 import argparse
+from pathlib import Path
 from SUPIR.util import create_SUPIR_model, PIL2Tensor, Tensor2PIL, convert_dtype
 from PIL import Image
 from llava.llava_agent import LLavaAgent
 from CKPT_PTH import LLAVA_MODEL_PATH
 import os
+import numpy as np
 from torch.nn.functional import interpolate
 
 if torch.cuda.device_count() >= 2:
@@ -20,6 +22,8 @@ else:
 parser = argparse.ArgumentParser()
 parser.add_argument("--img_dir", type=str)
 parser.add_argument("--save_dir", type=str)
+parser.add_argument("--hr_dir", type=str, default=None, help="Path to HR images aligned with LR")
+parser.add_argument("--mask_dir", type=str, default=None, help="Path to binary masks aligned with LR/HR")
 parser.add_argument("--upscale", type=int, default=1)
 parser.add_argument("--SUPIR_sign", type=str, default='Q', choices=['F', 'Q'])
 parser.add_argument("--seed", type=int, default=1234)
@@ -54,12 +58,25 @@ parser.add_argument("--use_tile_vae", action='store_true', default=False)
 parser.add_argument("--encoder_tile_size", type=int, default=512)
 parser.add_argument("--decoder_tile_size", type=int, default=64)
 parser.add_argument("--load_8bit_llava", action='store_true', default=False)
+parser.add_argument("--max_images", type=int, default=None, help="Limit number of images to process")
 args = parser.parse_args()
 print(args)
 use_llava = not args.no_llava
 
+# preload available masks (sorted for determinism)
+mask_paths = []
+if args.mask_dir is not None and os.path.isdir(args.mask_dir):
+    mask_paths = sorted(
+        [
+            os.path.join(args.mask_dir, p)
+            for p in os.listdir(args.mask_dir)
+            if p.lower().endswith(('.png', '.jpg', '.jpeg'))
+        ]
+    )
+
 # load SUPIR
-model = create_SUPIR_model('options/SUPIR_v0.yaml', SUPIR_sign=args.SUPIR_sign)
+config_path = Path(__file__).resolve().parent / "options" / "SUPIR_v0.yaml"
+model = create_SUPIR_model(str(config_path), SUPIR_sign=args.SUPIR_sign)
 if args.loading_half_params:
     model = model.half()
 if args.use_tile_vae:
@@ -74,12 +91,26 @@ else:
     llava_agent = None
 
 os.makedirs(args.save_dir, exist_ok=True)
-for img_pth in os.listdir(args.img_dir):
+for idx, img_pth in enumerate(os.listdir(args.img_dir)):
+    if args.max_images is not None and idx >= args.max_images:
+        break
     img_name = os.path.splitext(img_pth)[0]
 
     LQ_ips = Image.open(os.path.join(args.img_dir, img_pth))
     LQ_img, h0, w0 = PIL2Tensor(LQ_ips, upsacle=args.upscale, min_size=args.min_size)
     LQ_img = LQ_img.unsqueeze(0).to(SUPIR_device)[:, :3, :, :]
+
+    # optional HR and mask
+    hr_tensor = None
+    if args.hr_dir is not None:
+        hr_path = os.path.join(args.hr_dir, img_pth)
+        if not os.path.exists(hr_path):
+            alt = os.path.join(args.hr_dir, f"{img_name}.png")
+            hr_path = alt if os.path.exists(alt) else None
+        if hr_path is not None and os.path.exists(hr_path):
+            HR_ips = Image.open(hr_path)
+            hr_tensor, _, _ = PIL2Tensor(HR_ips, upsacle=args.upscale, min_size=args.min_size)
+            hr_tensor = hr_tensor.unsqueeze(0).to(SUPIR_device)[:, :3, :, :]
 
     # step 1: Pre-denoise for LLaVA, resize to 512
     LQ_img_512, h1, w1 = PIL2Tensor(LQ_ips, upsacle=args.upscale, min_size=args.min_size, fix_resize=512)
@@ -95,12 +126,28 @@ for img_pth in os.listdir(args.img_dir):
     print(captions)
 
     # # step 3: Diffusion Process
-    samples = model.batchify_sample(LQ_img, captions, num_steps=args.edm_steps, restoration_scale=args.s_stage1, s_churn=args.s_churn,
-                                    s_noise=args.s_noise, cfg_scale=args.s_cfg, control_scale=args.s_stage2, seed=args.seed,
-                                    num_samples=args.num_samples, p_p=args.a_prompt, n_p=args.n_prompt, color_fix_type=args.color_fix_type,
-                                    use_linear_CFG=args.linear_CFG, use_linear_control_scale=args.linear_s_stage2,
-                                    cfg_scale_start=args.spt_linear_CFG, control_scale_start=args.spt_linear_s_stage2)
-    # save
-    for _i, sample in enumerate(samples):
-        Tensor2PIL(sample, h0, w0).save(f'{args.save_dir}/{img_name}_{_i}.png')
+    # step 3: Diffusion Process for each mask (or once if no masks)
+    masks_iter = mask_paths if mask_paths else [None]
+    for mask_path in masks_iter:
+        mask_tensor = None
+        mask_tag = None
+        if mask_path is not None:
+            mask_pil = Image.open(mask_path).convert('L')
+            # resize mask to match current LQ tensor spatial size
+            mw, mh = LQ_img.shape[-1], LQ_img.shape[-2]
+            mask_pil = mask_pil.resize((mw, mh), Image.NEAREST)
+            mask_np = np.array(mask_pil, dtype=np.float32) / 255.0
+            mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(SUPIR_device)
+            mask_tag = Path(mask_path).stem
+
+        samples = model.batchify_sample(LQ_img, captions, num_steps=args.edm_steps, restoration_scale=args.s_stage1, s_churn=args.s_churn,
+                                        s_noise=args.s_noise, cfg_scale=args.s_cfg, control_scale=args.s_stage2, seed=args.seed,
+                                        num_samples=args.num_samples, p_p=args.a_prompt, n_p=args.n_prompt, color_fix_type=args.color_fix_type,
+                                        use_linear_CFG=args.linear_CFG, use_linear_control_scale=args.linear_s_stage2,
+                                        cfg_scale_start=args.spt_linear_CFG, control_scale_start=args.spt_linear_s_stage2,
+                                        hr_tensor=hr_tensor, mask_tensor=mask_tensor)
+        # save
+        for _i, sample in enumerate(samples):
+            suffix = f"_{mask_tag}" if mask_tag else ""
+            Tensor2PIL(sample, h0, w0).save(f'{args.save_dir}/{img_name}{suffix}_{_i}.png')
 

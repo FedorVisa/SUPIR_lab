@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.env
+.venv
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Checkpoints / weights / large binaries
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.msgpack
+*.h5
+weights/
+
+# Generated outputs (adjust as needed)
+# images_out*/
+# metrics*/
+logs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Build / dist
+build/
+dist/
+
+# HuggingFace cache
+huggingface/
+.cache/
+
+data/

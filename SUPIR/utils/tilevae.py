@@ -73,8 +73,11 @@ import SUPIR.utils.devices as devices
 try:
     import xformers
     import xformers.ops
-except ImportError:
-    pass
+    XFORMERS_IS_AVAILABLE = True
+except Exception:
+    xformers = None
+    XFORMERS_IS_AVAILABLE = False
+    print("no module 'xformers'. Processing without...")
 
 sd_flag = True
 
@@ -332,8 +335,15 @@ def xformer_attn_forward(self, h_):
         .contiguous(),
         (q, k, v),
     )
-    out = xformers.ops.memory_efficient_attention(
-        q, k, v, attn_bias=None, op=self.attention_op)
+    if XFORMERS_IS_AVAILABLE:
+        out = xformers.ops.memory_efficient_attention(
+            q, k, v, attn_bias=None, op=self.attention_op)
+    else:
+        # fallback scaled dot-product attention
+        scale = (C ** -0.5)
+        attn = torch.bmm(q, k.transpose(1, 2)) * scale
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.bmm(attn, v)
 
     out = (
         out.unsqueeze(0)
